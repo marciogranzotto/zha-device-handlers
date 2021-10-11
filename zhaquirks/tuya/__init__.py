@@ -88,6 +88,11 @@ TUYA_COVER_COMMAND = {
     "_TZE200_xuzcvlku": {0x0000: 0x0000, 0x0001: 0x0002, 0x0002: 0x0001},
     "_TZE200_rddyvrci": {0x0000: 0x0002, 0x0001: 0x0001, 0x0002: 0x0000},
     "_TZE200_3i3exuay": {0x0000: 0x0000, 0x0001: 0x0002, 0x0002: 0x0001},
+    "_TZE200_nueqqe6k": {0x0000: 0x0000, 0x0001: 0x0002, 0x0002: 0x0001},
+    "_TZE200_gubdgai2": {0x0000: 0x0000, 0x0001: 0x0002, 0x0002: 0x0001},
+    "_TZE200_zpzndjez": {0x0000: 0x0000, 0x0001: 0x0002, 0x0002: 0x0001},
+    "_TZE200_cowvfni3": {0x0000: 0x0002, 0x0001: 0x0000, 0x0002: 0x0001},
+    "_TYST11_wmcdj3aq": {0x0000: 0x0000, 0x0001: 0x0002, 0x0002: 0x0001},
 }
 # ---------------------------------------------------------
 # TUYA Switch Custom Values
@@ -231,6 +236,7 @@ class TuyaManufCluster(CustomCluster):
     cluster_id = TUYA_CLUSTER_ID
     ep_attribute = "tuya_manufacturer"
     set_time_offset = 0
+    set_time_local_offset = None
 
     class Command(t.Struct):
         """Tuya manufacturer cluster command."""
@@ -252,6 +258,7 @@ class TuyaManufCluster(CustomCluster):
             Zigbee payload is very similar to the UART payload which is described here: https://developer.tuya.com/en/docs/iot/device-development/access-mode-mcu/zigbee-general-solution/tuya-zigbee-module-uart-communication-protocol/tuya-zigbee-module-uart-communication-protocol?id=K9ear5khsqoty#title-10-Time%20synchronization
 
             Some devices need the timestamp in seconds from 1/1/1970 and others in seconds from 1/1/2000.
+            Also, there is devices which uses both timestamps variants (probably bug). Use set_time_local_offset var in this cases.
 
             NOTE: You need to wait for time request before setting it. You can't set time without request."""
 
@@ -302,7 +309,10 @@ class TuyaManufCluster(CustomCluster):
         )
         local_timestamp = int(
             (
-                datetime.datetime.now() - datetime.datetime(self.set_time_offset, 1, 1)
+                datetime.datetime.now()
+                - datetime.datetime(
+                    self.set_time_local_offset or self.set_time_offset, 1, 1
+                )
             ).total_seconds()
         )
         payload.extend(utc_timestamp.to_bytes(4, "big", signed=False))
@@ -386,7 +396,7 @@ class TuyaManufClusterAttributes(TuyaManufCluster):
                 tsn=cmd_payload.tsn,
             )
 
-        return (foundation.Status.SUCCESS,)
+        return [[foundation.WriteAttributesStatusRecord(foundation.Status.SUCCESS)]]
 
 
 class TuyaOnOff(CustomCluster, OnOff):
@@ -509,7 +519,7 @@ class TuyaThermostatCluster(LocalDataCluster, Thermostat):
         records = self._write_attr_records(attributes)
 
         if not records:
-            return (foundation.Status.SUCCESS,)
+            return [[foundation.WriteAttributesStatusRecord(foundation.Status.SUCCESS)]]
 
         manufacturer_attrs = {}
         for record in records:
@@ -531,13 +541,20 @@ class TuyaThermostatCluster(LocalDataCluster, Thermostat):
             manufacturer_attrs.update(new_attrs)
 
         if not manufacturer_attrs:
-            return (foundation.Status.FAILURE,)
+            return [
+                [
+                    foundation.WriteAttributesStatusRecord(
+                        foundation.Status.FAILURE, r.attrid
+                    )
+                    for r in records
+                ]
+            ]
 
         await self.endpoint.tuya_manufacturer.write_attributes(
             manufacturer_attrs, manufacturer=manufacturer
         )
 
-        return (foundation.Status.SUCCESS,)
+        return [[foundation.WriteAttributesStatusRecord(foundation.Status.SUCCESS)]]
 
     # pylint: disable=W0236
     async def command(
@@ -551,11 +568,11 @@ class TuyaThermostatCluster(LocalDataCluster, Thermostat):
         """Implement thermostat commands."""
 
         if command_id != 0x0000:
-            return foundation.Status.UNSUP_CLUSTER_COMMAND
+            return [command_id, foundation.Status.UNSUP_CLUSTER_COMMAND]
 
         mode, offset = args
         if mode not in (self.SetpointMode.Heat, self.SetpointMode.Both):
-            return foundation.Status.INVALID_VALUE
+            return [command_id, foundation.Status.INVALID_VALUE]
 
         attrid = self.attridx["occupied_heating_setpoint"]
 
@@ -566,10 +583,11 @@ class TuyaThermostatCluster(LocalDataCluster, Thermostat):
             return foundation.Status.FAILURE
 
         # offset is given in decidegrees, see Zigbee cluster specification
-        return await self.write_attributes(
+        (res,) = await self.write_attributes(
             {"occupied_heating_setpoint": current + offset * 10},
             manufacturer=manufacturer,
         )
+        return [command_id, res[0].status]
 
 
 class TuyaUserInterfaceCluster(LocalDataCluster, UserInterface):
@@ -622,13 +640,20 @@ class TuyaUserInterfaceCluster(LocalDataCluster, UserInterface):
             manufacturer_attrs.update(new_attrs)
 
         if not manufacturer_attrs:
-            return (foundation.Status.FAILURE,)
+            return [
+                [
+                    foundation.WriteAttributesStatusRecord(
+                        foundation.Status.FAILURE, r.attrid
+                    )
+                    for r in records
+                ]
+            ]
 
         await self.endpoint.tuya_manufacturer.write_attributes(
             manufacturer_attrs, manufacturer=manufacturer
         )
 
-        return (foundation.Status.SUCCESS,)
+        return [[foundation.WriteAttributesStatusRecord(foundation.Status.SUCCESS)]]
 
 
 class TuyaPowerConfigurationCluster(LocalDataCluster, PowerConfiguration):
@@ -704,6 +729,21 @@ class TuyaSmartRemoteOnOffCluster(OnOff, EventableCluster):
             self.listener_event(
                 ZHA_SEND_EVENT, self.press_type.get(press_type, "unknown"), []
             )
+
+
+class TZBPowerOnState(t.enum8):
+    """Tuya power on state enum."""
+
+    Off = 0x00
+    On = 0x01
+    LastState = 0x02
+
+
+class TuyaZBOnOffRestorePowerCluster(CustomCluster, OnOff):
+    """Tuya on off Zigbee cluster with restore state."""
+
+    attributes = OnOff.attributes.copy()
+    attributes.update({0x8002: ("power_on_state", TZBPowerOnState)})
 
 
 # Tuya Window Cover Implementation
